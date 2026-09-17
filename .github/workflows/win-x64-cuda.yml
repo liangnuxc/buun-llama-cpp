@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# buun-llama-cpp -- Windows x64 build (v2)
+# buun-llama-cpp -- Windows x64 build (v4)
 #
 #   ui-build                  -> llama-ui.zip
 #   windows-cpu (release)     -> full exe bundle   [preferred]
@@ -9,7 +9,70 @@
 #
 # Derived from .github/workflows/release.yml in spiritbuun/buun-llama-cpp.
 # ---------------------------------------------------------------------------
-# WHAT CHANGED FROM v1, AND WHY  (nothing else was touched)
+# WHAT CHANGED FROM v3, AND WHY  (the CUDA job was the last thing standing)
+#
+# v3 proved the RPC fix: both windows-cpu variants went green (run 35249908324).
+# The remaining failure was int8-channel.cu in windows-cuda-x64:
+#
+#   bsa_vendor/cutlass/epilogue/threadblock/output_tile_thread_map.h(242):
+#     error: expression must have a constant value
+#     note #2703-D: cannot call non-constexpr function "cutlass::const_min"
+#                   (declared at line 737 of bsa_vendor/cutlass/fast_math.h)
+#
+# fast_math.h declares it as `CUTLASS_HOST_DEVICE CUTLASS_CONSTEXPR_IF_CXX17 int
+# const_min(...)`, and that macro only became `constexpr` when
+# `201700L <= __cplusplus`. MSVC reports __cplusplus as 199711L unless
+# /Zc:__cplusplus is given, so the macro expanded to nothing and const_min stopped
+# being constexpr -- which breaks the `static int const kAccessWidth = ...`
+# initialisers that feed it. Two changes here:
+#
+#   1. "-DCMAKE_CUDA_FLAGS=-Xcompiler /Zc:__cplusplus" in the CUDA Configure step,
+#      so MSVC reports the real C++ version. Passed as one -Xcompiler argument,
+#      the same way ggml already injects /Zc:preprocessor.
+#   2. The vendored bsa_vendor/cutlass/detail/helper_macros.hpp is patched to force
+#      the C++17 branch (ggml always builds CUDA with -std=c++17). Belt and braces:
+#      step 1 alone depends on the flag reaching every nvcc pass.
+#
+# Also: the CUDA job's Configure and Build are now separate steps and the CUDA
+# build log is uploaded with `if: always()`. The v3 failure was only diagnosable
+# by downloading the job log through the API -- that gap is closed.
+# ---------------------------------------------------------------------------
+# WHAT CHANGED FROM v2, AND WHY  (one line, and it is the actual bug)
+#
+# The v2 run got past Configure (clang 20.1.8 was picked up correctly, so the
+# vcvarsall removal worked) and then failed while compiling ggml-rpc:
+#
+#   ggml/include/ggml-rpc.h:17:15: error: static assertion failed due to
+#     requirement 'GGML_OP_COUNT == 105': GGML_OP_COUNT has changed - update RPC
+#   note: expression evaluates to '106 == 105'
+#
+# That is a stale assertion in the fork's own source. The fork added ops (the
+# header comment names "tree ops + TURBO_WHT + DSV4_HC_PARAMS"), so
+# GGML_OP_COUNT is now 106, but ggml-rpc.h still asserts 105. It fails on every
+# platform and with every compiler -- nothing to do with the toolchain.
+#
+# Why nobody noticed: ggml/CMakeLists.txt:256 declares
+#     option(GGML_RPC "ggml: use RPC" OFF)
+# -- the fork defaults RPC to OFF, so the author never compiles that backend.
+# Upstream's release.yml, however, forces it on:
+#     CMAKE_ARGS: "... -DGGML_RPC=ON"
+# v1/v2 copied that string verbatim, which is how the broken backend got built.
+#
+# Fix: do not force RPC on. We are building a local single-machine release, so
+# the RPC backend (distributed inference) is dead weight -- and it is the only
+# place that stale assertion is evaluated. With GGML_RPC=OFF:
+#   - ggml/src/ggml-rpc is never added as a backend
+#   - tools/CMakeLists.txt:32 gates `add_subdirectory(rpc)` behind GGML_RPC,
+#     so llama-rpc-server is not built either
+#   - nothing links against it: common/arg.cpp finds the backend dynamically
+#     via ggml_backend_reg_by_name("RPC"), it does not reference any symbol
+# So there is no dangling reference. Pass --rpc and you get a clean runtime
+# error ("failed to find RPC backend") instead of a build failure.
+#
+# (If you ever do want RPC, the alternative fix is to edit ggml-rpc.h:17 and
+#  change `GGML_OP_COUNT == 105` to `== 106`, then put -DGGML_RPC=ON back.)
+# ---------------------------------------------------------------------------
+# WHAT CHANGED FROM v1, AND WHY  (still in effect)
 #
 # 1. runner_cpu now defaults to `windows-2025` instead of `windows-2025-vs2026`.
 #    - The windows-2025 image ships exactly LLVM 20.1.8, which is the version
@@ -71,6 +134,11 @@ env:
   GH_TOKEN: ${{ github.token }}
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   # exactly as in the upstream release workflow -- drops examples/tests, keeps tools+server
+  # EXCEPT for one character: GGML_RPC is OFF, not ON. The upstream value forces
+  # the ggml-rpc backend to be compiled, and that backend does not compile in
+  # this fork (stale static_assert in ggml/include/ggml-rpc.h -- see the header
+  # comment above). RPC is distributed inference across machines; not needed
+  # for a local build, and the fork's own default is OFF.
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=OFF"
 
 jobs:
@@ -234,8 +302,7 @@ jobs:
         with:
           key: win-x64-cuda-${{ inputs.cuda_version }}
 
-      - name: Build
-        id: cmake_build
+      - name: Configure
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
@@ -244,9 +311,34 @@ jobs:
             -DGGML_NATIVE=OFF ^
             -DGGML_CPU=OFF ^
             -DGGML_CUDA=ON ^
-            -DLLAMA_BUILD_BORINGSSL=ON ${{ inputs.cuda_version == '12.4' && '-DGGML_CUDA_CUB_3DOT2=ON' || '' }}
+            "-DCMAKE_CUDA_FLAGS=-Xcompiler /Zc:__cplusplus" ^
+            -DLLAMA_BUILD_BORINGSSL=ON ${{ inputs.cuda_version == '12.4' && '-DGGML_CUDA_CUB_3DOT2=ON' || '' }} > configure.log 2>&1
+          set RC=%ERRORLEVEL%
+          type configure.log
+          exit /b %RC%
+
+      - name: Build
+        id: cmake_build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda > cuda-build.log 2>&1
+          set RC=%ERRORLEVEL%
+          powershell -NoProfile -Command "Get-Content cuda-build.log -Tail 250"
+          if not %RC%==0 powershell -NoProfile -Command "Select-String -Path cuda-build.log -Pattern 'error|FAILED' | Select-Object -First 40 | ForEach-Object { $_.Line }"
+          exit /b %RC%
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-log-cuda
+          path: |
+            configure.log
+            cuda-build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Pack artifacts
         id: pack_artifacts

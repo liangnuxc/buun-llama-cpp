@@ -143,13 +143,23 @@ namespace cutlass {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if (201700L <= __cplusplus)
+// ggml always builds the CUDA backend with -std=c++17 (see the CUDA_FLAGS in
+// ggml/src/ggml-cuda/CMakeLists.txt), so force the C++17 branch.
+//
+// The original condition was `#if (201700L <= __cplusplus)`. That mis-detects whenever
+// MSVC is the host compiler: cl.exe reports __cplusplus as 199711L unless /Zc:__cplusplus
+// is given, and nvcc does not reliably forward that flag to every compilation pass. The
+// macro then expands to nothing, leaving cutlass::const_min / const_max non-constexpr,
+// which breaks cutlass/epilogue/threadblock/output_tile_thread_map.h:
+//
+//   error: expression must have a constant value
+//   note #2703-D: cannot call non-constexpr function "cutlass::const_min"
+//
+// (The newer vendored CUTLASS under fp8-cutlass/ solves the same problem by consulting
+// _MSVC_LANG. Every user of this macro inside bsa_vendor is a small arithmetic helper --
+// gcd, lcm, round_up, ceil_div, const_min, const_max -- so forcing constexpr is safe.)
 #define CUTLASS_CONSTEXPR_IF_CXX17 constexpr
 #define CUTLASS_CXX17_OR_LATER 1
-#else
-#define CUTLASS_CONSTEXPR_IF_CXX17
-#define CUTLASS_CXX17_OR_LATER 0
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
