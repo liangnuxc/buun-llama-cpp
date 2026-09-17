@@ -1,24 +1,46 @@
 # ---------------------------------------------------------------------------
-# buun-llama-cpp -- Windows x64 build
-#   job 1: ui-build        -> llama-ui.zip            (reuses the repo's own workflow)
-#   job 2: windows-cpu-x64 -> main exe bundle         (windows-cpu job, trimmed)
-#   job 3: windows-cuda-x64-> ggml-cuda.dll + cudart  (windows-cuda job, trimmed)
-#   job 4: package         -> one ready-to-run release zip
+# buun-llama-cpp -- Windows x64 build (v2)
+#
+#   ui-build                  -> llama-ui.zip
+#   windows-cpu (release)     -> full exe bundle   [preferred]
+#   windows-cpu (no-openmp)   -> full exe bundle   [fallback variant]
+#   windows-cuda-x64          -> ggml-cuda.dll + cudart runtime
+#   package                   -> one ready-to-run release zip
 #
 # Derived from .github/workflows/release.yml in spiritbuun/buun-llama-cpp.
-# The build commands are copied verbatim; only the matrix and job set were cut
-# down from 28 jobs to 4.
+# ---------------------------------------------------------------------------
+# WHAT CHANGED FROM v1, AND WHY  (nothing else was touched)
 #
-# Deliberate deviations, all listed here so nothing is hidden:
-#   1. x64 only          - arm64 matrix entries dropped (no arm64 machine needed)
-#   2. vswhere           - Visual Studio path resolved at runtime instead of the
-#                          hardcoded "...\Visual Studio\18\Enterprise" path, so
-#                          this also works on images that ship VS 2022.
-#   3. no ccache-clear   - upstream deletes the cache after every run; keeping it
-#                          makes a retry much faster.
-#   4. package job       - merges the three raw artifacts into a single zip and
-#                          fixes the cudart sub-directory layout. If it fails, the
-#                          three raw artifacts are still there to download.
+# 1. runner_cpu now defaults to `windows-2025` instead of `windows-2025-vs2026`.
+#    - The windows-2025 image ships exactly LLVM 20.1.8, which is the version
+#      ggml/src/CMakeLists.txt hard-pins for GGML_OPENMP_FETCH:
+#          set(GGML_OPENMP_LLVM_VERSION "20.1.8")
+#          if (NOT GGML_OPENMP_COMPILER_VERSION_MAJOR STREQUAL 20)
+#              message(FATAL_ERROR "LLVM OpenMP 20.1.8 requires Clang 20.x")
+#    - The vs2026 preview image additionally bundles its own clang inside Visual
+#      Studio (component VC.Llvm.Clang 18.9.12009.112). Any `call vcvarsall.bat`
+#      puts that bundled clang ahead of LLVM 20.1.8 on PATH.
+#
+# 2. The `call vcvarsall.bat` line is gone.
+#    Upstream's own Windows CPU CI (.github/workflows/build-cpu.yml, job
+#    `windows`, on windows-2025) builds with plain clang and never calls
+#    vcvarsall. Dropping it removes both the dependency on the VS18 preview path
+#    and the "which clang wins on PATH" question.
+#
+# 3. The build is split into Configure / Build and the complete output is saved
+#    to configure.log / build.log, then uploaded as an artifact even on failure
+#    (`if: always()`), together with fingerprint.log and CMakeError.log. A
+#    failing run is now diagnosable without needing a GitHub login to read logs.
+#
+# 4. New `Environment fingerprint` step records clang / cmake / ninja / 7z
+#    versions and the resolved Visual Studio path.
+#
+# 5. The CPU job now runs two variants in parallel (fail-fast disabled):
+#      release   : -DGGML_OPENMP=ON  -DGGML_OPENMP_FETCH=ON   (as in release.yml)
+#      no-openmp : -DGGML_OPENMP=OFF -DGGML_OPENMP_FETCH=OFF  (as in upstream CI's
+#                  GGML_CPU_ALL_VARIANTS variant, which deliberately turns OpenMP off)
+#    If one variant fails, the other still supplies the executables. The package
+#    job prefers `release` and falls back to `no-openmp`.
 # ---------------------------------------------------------------------------
 name: Build Windows x64 (CUDA)
 
@@ -36,13 +58,13 @@ on:
           - '13.1'
           - '12.4'
       runner_cpu:
-        description: 'Runner image for the exe build. Change only if the default is unavailable.'
+        description: 'Runner image for the exe build. windows-2025 ships LLVM 20.1.8 = the version ggml pins.'
         required: true
-        default: 'windows-2025-vs2026'
+        default: 'windows-2025'
         type: choice
         options:
-          - 'windows-2025-vs2026'
           - 'windows-2025'
+          - 'windows-2025-vs2026'
           - 'windows-2022'
 
 env:
@@ -61,14 +83,28 @@ jobs:
 
   # -------------------------------------------------------------------------
   # 2. Main bundle: every executable + base DLLs + CPU backend variants.
+  #    Two variants in parallel; either one alone is enough for the package.
   # -------------------------------------------------------------------------
   windows-cpu-x64:
-    name: windows-cpu (x64)
+    name: windows-cpu (${{ matrix.variant }})
     needs: [ui-build]
     runs-on: ${{ inputs.runner_cpu }}
 
     permissions:
       actions: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: 'release'
+            tag: ''
+            openmp: 'ON'
+            fetch_openmp: 'ON'
+          - variant: 'no-openmp'
+            tag: '-noopenmp'
+            openmp: 'OFF'
+            fetch_openmp: 'OFF'
 
     steps:
       - name: Clone
@@ -89,41 +125,88 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: win-x64-cpu-${{ inputs.runner_cpu }}
+          key: win-x64-cpu-${{ matrix.variant }}-${{ inputs.runner_cpu }}
 
-      - name: Build
+      # -- records what we are actually building with; plain text, no gates ---
+      - name: Environment fingerprint
         shell: cmd
         run: |
-          set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
-          echo Using Visual Studio at: "%VSPATH%"
-          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          echo == runner == > fingerprint.log
+          echo ImageOS=%ImageOS% RUNNER_OS=%RUNNER_OS% PROCESSORS=%NUMBER_OF_PROCESSORS% >> fingerprint.log
+          echo == clang == >> fingerprint.log
+          where clang >> fingerprint.log 2>&1
+          clang --version >> fingerprint.log 2>&1
+          echo == clang++ == >> fingerprint.log
+          clang++ --version >> fingerprint.log 2>&1
+          echo == cmake == >> fingerprint.log
+          cmake --version >> fingerprint.log 2>&1
+          echo == ninja == >> fingerprint.log
+          ninja --version >> fingerprint.log 2>&1
+          echo == 7z == >> fingerprint.log
+          where 7z >> fingerprint.log 2>&1
+          echo == visual studio == >> fingerprint.log
+          "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath >> fingerprint.log 2>&1
+          echo == PATH clang entries == >> fingerprint.log
+          echo %PATH% | find /i "llvm" >> fingerprint.log 2>&1
+          type fingerprint.log
+          exit /b 0
+
+      - name: Configure
+        shell: cmd
+        run: |
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
             -DGGML_CPU_ALL_VARIANTS=ON ^
-            -DGGML_OPENMP=ON ^
-            -DGGML_OPENMP_FETCH=ON ^
-            ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release
+            -DGGML_OPENMP=${{ matrix.openmp }} ^
+            -DGGML_OPENMP_FETCH=${{ matrix.fetch_openmp }} ^
+            %CMAKE_ARGS% > configure.log 2>&1
+          set RC=%ERRORLEVEL%
+          type configure.log
+          exit /b %RC%
+
+      - name: Build
+        shell: cmd
+        run: |
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          if %NINJA_JOBS% LSS 1 set NINJA_JOBS=1
+          cmake --build build --config Release -j %NINJA_JOBS% > build.log 2>&1
+          set RC=%ERRORLEVEL%
+          powershell -NoProfile -Command "Get-Content build.log -Tail 250"
+          exit /b %RC%
 
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+          7z a -snl llama-bin-win-cpu-x64${{ matrix.tag }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-cpu-x64.zip
-          name: llama-bin-win-cpu-x64.zip
+          path: llama-bin-win-cpu-x64${{ matrix.tag }}.zip
+          name: llama-bin-win-cpu-x64${{ matrix.tag }}.zip
+          retention-days: 7
+
+      # -- always, so a failed run still tells us exactly why it failed ------
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-log-cpu-${{ matrix.variant }}
+          path: |
+            configure.log
+            build.log
+            fingerprint.log
+            build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
           retention-days: 7
 
   # -------------------------------------------------------------------------
   # 3. CUDA backend only. llama-server comes from the cpu bundle above --
   #    that is how upstream splits it too.
+  #    Unchanged from release.yml: windows-2022 runner, MSVC, GGML_CPU=OFF.
   # -------------------------------------------------------------------------
   windows-cuda-x64:
     name: windows-cuda (${{ inputs.cuda_version }}, x64)
@@ -199,6 +282,8 @@ jobs:
   package:
     name: package (single release zip)
     needs: [windows-cpu-x64, windows-cuda-x64]
+    # run even when one of them failed -- the script reports exactly what is missing
+    if: ${{ always() }}
     runs-on: ubuntu-latest
 
     steps:
@@ -214,18 +299,31 @@ jobs:
 
       - name: Merge into one folder
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p stage dist
 
           echo "== downloaded =="
-          find raw -name '*.zip' -print
+          find raw -type f | head -40
 
-          CPU_ZIP=$(find raw -path '*llama-bin-win-cpu-x64*' -name '*.zip' | head -n1)
-          CUDA_ZIP=$(find raw -path '*llama-bin-win-cuda-*' -name '*.zip' -not -path '*cudart*' | head -n1)
-          CUDART_ZIP=$(find raw -path '*cudart*' -name '*.zip' | head -n1)
+          # `download-artifact` puts each artifact in its own folder whose name
+          # equals the artifact name, so the file itself sits one level deeper.
+          # -type f matters: without it `find` matches that folder too.
+          # prefer the full variant, fall back to the no-openmp one.
+          CPU_ZIP=""
+          for cand in llama-bin-win-cpu-x64.zip llama-bin-win-cpu-x64-noopenmp.zip; do
+            found=$(find raw -type f -name "$cand" -print -quit)
+            if [ -n "$found" ]; then CPU_ZIP="$found"; break; fi
+          done
+          CUDA_ZIP=$(find raw -type f -name 'llama-bin-win-cuda-*.zip' -print -quit)
+          CUDART_ZIP=$(find raw -type f -name 'cudart-llama-bin-win-cuda-*.zip' -print -quit)
+
           echo "cpu   : $CPU_ZIP"
           echo "cuda  : $CUDA_ZIP"
           echo "cudart: $CUDART_ZIP"
+
+          [ -n "$CPU_ZIP" ]    || { echo "ERROR: no CPU exe bundle artifact found";    exit 1; }
+          [ -n "$CUDA_ZIP" ]   || { echo "ERROR: no CUDA backend artifact found";      exit 1; }
+          [ -n "$CUDART_ZIP" ] || { echo "ERROR: no cudart runtime artifact found";    exit 1; }
 
           unzip -q -o "$CPU_ZIP"    -d stage/cpu
           unzip -q -o "$CUDA_ZIP"   -d stage/cuda
