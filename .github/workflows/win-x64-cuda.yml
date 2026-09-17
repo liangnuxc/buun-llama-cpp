@@ -1,0 +1,313 @@
+# ---------------------------------------------------------------------------
+# buun-llama-cpp -- Windows x64 build
+#   job 1: ui-build        -> llama-ui.zip            (reuses the repo's own workflow)
+#   job 2: windows-cpu-x64 -> main exe bundle         (windows-cpu job, trimmed)
+#   job 3: windows-cuda-x64-> ggml-cuda.dll + cudart  (windows-cuda job, trimmed)
+#   job 4: package         -> one ready-to-run release zip
+#
+# Derived from .github/workflows/release.yml in spiritbuun/buun-llama-cpp.
+# The build commands are copied verbatim; only the matrix and job set were cut
+# down from 28 jobs to 4.
+#
+# Deliberate deviations, all listed here so nothing is hidden:
+#   1. x64 only          - arm64 matrix entries dropped (no arm64 machine needed)
+#   2. vswhere           - Visual Studio path resolved at runtime instead of the
+#                          hardcoded "...\Visual Studio\18\Enterprise" path, so
+#                          this also works on images that ship VS 2022.
+#   3. no ccache-clear   - upstream deletes the cache after every run; keeping it
+#                          makes a retry much faster.
+#   4. package job       - merges the three raw artifacts into a single zip and
+#                          fixes the cudart sub-directory layout. If it fails, the
+#                          three raw artifacts are still there to download.
+# ---------------------------------------------------------------------------
+name: Build Windows x64 (CUDA)
+
+on:
+  # manual only -- nothing runs by itself after you fork
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: 'CUDA toolkit version. 13.3 = native Blackwell/sm_120 (RTX 50xx).'
+        required: true
+        default: '13.3'
+        type: choice
+        options:
+          - '13.3'
+          - '13.1'
+          - '12.4'
+      runner_cpu:
+        description: 'Runner image for the exe build. Change only if the default is unavailable.'
+        required: true
+        default: 'windows-2025-vs2026'
+        type: choice
+        options:
+          - 'windows-2025-vs2026'
+          - 'windows-2025'
+          - 'windows-2022'
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  # exactly as in the upstream release workflow -- drops examples/tests, keeps tools+server
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Build the web UI (embedded into llama-server later). Reuses the repo's
+  #    own reusable workflow, unmodified. Needs no secrets.
+  # -------------------------------------------------------------------------
+  ui-build:
+    uses: ./.github/workflows/ui-build.yml
+
+  # -------------------------------------------------------------------------
+  # 2. Main bundle: every executable + base DLLs + CPU backend variants.
+  # -------------------------------------------------------------------------
+  windows-cpu-x64:
+    name: windows-cpu (x64)
+    needs: [ui-build]
+    runs-on: ${{ inputs.runner_cpu }}
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download UI build
+        uses: actions/download-artifact@v7
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: win-x64-cpu-${{ inputs.runner_cpu }}
+
+      - name: Build
+        shell: cmd
+        run: |
+          set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          echo Using Visual Studio at: "%VSPATH%"
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cpu-x64.zip
+          name: llama-bin-win-cpu-x64.zip
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 3. CUDA backend only. llama-server comes from the cpu bundle above --
+  #    that is how upstream splits it too.
+  # -------------------------------------------------------------------------
+  windows-cuda-x64:
+    name: windows-cuda (${{ inputs.cuda_version }}, x64)
+    runs-on: windows-2022
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ inputs.cuda_version }}
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: win-x64-cuda-${{ inputs.cuda_version }}
+
+      - name: Build
+        id: cmake_build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ${{ inputs.cuda_version == '12.4' && '-DGGML_CUDA_CUB_3DOT2=ON' || '' }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-cuda-${{ inputs.cuda_version }}-x64.zip .\build\bin\Release\ggml-cuda.dll
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda-${{ inputs.cuda_version }}-x64.zip
+          name: llama-bin-win-cuda-${{ inputs.cuda_version }}-x64.zip
+          retention-days: 7
+
+      - name: Copy and pack Cuda runtime (x64)
+        run: |
+          echo "Cuda install location: ${{ env.CUDA_PATH }}"
+          $dst='.\build\bin\cudart\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          7z a cudart-llama-bin-win-cuda-${{ inputs.cuda_version }}-x64.zip $dst\*
+
+      - name: Upload Cuda runtime
+        uses: actions/upload-artifact@v6
+        with:
+          path: cudart-llama-bin-win-cuda-${{ inputs.cuda_version }}-x64.zip
+          name: cudart-llama-bin-win-cuda-${{ inputs.cuda_version }}-x64.zip
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 4. Merge everything into one flat, ready-to-run folder and zip it.
+  # -------------------------------------------------------------------------
+  package:
+    name: package (single release zip)
+    needs: [windows-cpu-x64, windows-cuda-x64]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: raw
+
+      - name: Merge into one folder
+        run: |
+          set -euo pipefail
+          mkdir -p stage dist
+
+          echo "== downloaded =="
+          find raw -name '*.zip' -print
+
+          CPU_ZIP=$(find raw -path '*llama-bin-win-cpu-x64*' -name '*.zip' | head -n1)
+          CUDA_ZIP=$(find raw -path '*llama-bin-win-cuda-*' -name '*.zip' -not -path '*cudart*' | head -n1)
+          CUDART_ZIP=$(find raw -path '*cudart*' -name '*.zip' | head -n1)
+          echo "cpu   : $CPU_ZIP"
+          echo "cuda  : $CUDA_ZIP"
+          echo "cudart: $CUDART_ZIP"
+
+          unzip -q -o "$CPU_ZIP"    -d stage/cpu
+          unzip -q -o "$CUDA_ZIP"   -d stage/cuda
+          unzip -q -o "$CUDART_ZIP" -d stage/cudart
+
+          # the 7z archives store build/... prefixed paths -- find the real exe dir
+          EXEDIR=$(dirname "$(find stage/cpu -iname 'llama-server.exe' -print -quit | head -n1)")
+          if [ -z "${EXEDIR}" ] || [ "${EXEDIR}" = "." ]; then
+            EXEDIR=$(find stage/cpu -type d -exec sh -c 'n=$(find "$1" -maxdepth 1 -iname "*.exe" | wc -l); echo "$n $1"' _ {} \; \
+                     | sort -rn | head -n1 | cut -d' ' -f2-)
+          fi
+          echo "exe dir: $EXEDIR"
+          cp -f "$EXEDIR"/* dist/
+
+          # flatten every DLL next to the executables (this fixes the
+          # build/bin/cudart/ layout inside the cudart archive)
+          find stage/cuda   -iname '*.dll' -exec cp -f {} dist/ \;
+          find stage/cudart -iname '*.dll' -exec cp -f {} dist/ \;
+          if [ -f LICENSE ]; then cp -f LICENSE dist/; fi
+
+          # sanity check -- fail loudly rather than ship a broken package
+          test -f dist/llama-server.exe || { echo "ERROR: llama-server.exe missing"; ls -la dist; exit 1; }
+          test -f dist/ggml-cuda.dll    || { echo "ERROR: ggml-cuda.dll missing";    ls -la dist; exit 1; }
+          echo "== dist =="
+          ls -la dist
+
+      - name: Add README and launcher
+        run: |
+          set -euo pipefail
+
+          cat > dist/README.txt <<'EOF'
+          buun-llama-cpp -- Windows x64 + CUDA
+          ====================================
+
+          Portable build. Every executable and DLL sits flat in this folder.
+          No installer, no CUDA Toolkit install required -- the runtime DLLs are bundled.
+
+          Quick start
+          -----------
+          1. Put a GGUF model file somewhere, e.g. D:\models\model.gguf
+          2. Start the API server:
+               llama-server.exe -m D:\models\model.gguf -ngl 999 -c 8192
+             then open http://127.0.0.1:8080
+             (or drag the .gguf file onto run-server.cmd)
+          3. Or just chat in the terminal:
+               llama-cli.exe -m D:\models\model.gguf -ngl 999
+
+          Useful flags
+          ------------
+            -ngl N    layers to offload to the GPU; 999 = all
+            -c N      context size
+            -fa       enable flash attention
+
+          About
+          -----
+          * Built from source by GitHub Actions from: spiritbuun/buun-llama-cpp
+          * ggml-cuda.dll      = CUDA backend
+          * cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll = CUDA runtime
+          * Requires a recent NVIDIA driver. CUDA Toolkit is NOT required.
+          * The fork's headline features (VBR / TCQ KV cache) require the CUDA backend.
+          * License: see LICENSE
+          EOF
+
+          printf '@echo off\r\nsetlocal\r\nif "%%~1"=="" (\r\n  echo Usage: drag a .gguf file onto this script, or pass a path:\r\n  echo        run-server.cmd D:\\models\\model.gguf\r\n  pause\r\n  exit /b 1\r\n)\r\n"%%~dp0llama-server.exe" -m "%%~1" -ngl 999 -c 8192 %%2 %%3 %%4 %%5\r\n' > dist/run-server.cmd
+
+          echo "== final =="
+          ls -la dist
+
+      - name: Zip the package
+        run: |
+          set -euo pipefail
+          PKG="buun-llama-cpp-win-x64-cuda${{ inputs.cuda_version }}"
+          (cd dist && zip -q -r "../${PKG}.zip" .)
+          ls -la "${PKG}.zip"
+          sha256sum "${PKG}.zip" > "${PKG}.zip.sha256"
+          cat "${PKG}.zip.sha256"
+
+      - name: Upload the release package
+        uses: actions/upload-artifact@v6
+        with:
+          path: |
+            buun-llama-cpp-win-x64-cuda${{ inputs.cuda_version }}.zip
+            buun-llama-cpp-win-x64-cuda${{ inputs.cuda_version }}.zip.sha256
+          name: buun-llama-cpp-win-x64-cuda${{ inputs.cuda_version }}
+          retention-days: 30
