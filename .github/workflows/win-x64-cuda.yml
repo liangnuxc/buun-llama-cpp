@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# buun-llama-cpp -- Windows x64 build (v4)
+# buun-llama-cpp -- Windows x64 build (v5)
 #
 #   ui-build                  -> llama-ui.zip
 #   windows-cpu (release)     -> full exe bundle   [preferred]
@@ -8,6 +8,52 @@
 #   package                   -> one ready-to-run release zip
 #
 # Derived from .github/workflows/release.yml in spiritbuun/buun-llama-cpp.
+# ---------------------------------------------------------------------------
+# WHAT CHANGED FROM v4, AND WHY  (v4's two fixes worked; hit the next wall)
+#
+# v4 (run 35256224504) cleared BOTH v3 failures -- int8-channel.cu now compiles,
+# so the /Zc:__cplusplus + helper_macros.hpp patch is confirmed good. The build
+# then died one kernel later, on marlin-q4-a32.cu:
+#
+#   marlin-vendor/marlin_template.h(137): error: class
+#     "marlin::MarlinScalarType<11L>" has no member "num2num2"
+#     ... num22float2, num2float, nums2num2, float2num
+#     instantiated from select_marlin_kernel<C_F32>(...)
+#
+# type id 11 is vllm::kBFloat16 (scalar_type.hpp:54). In marlin_dtypes.cuh the
+# bf16 specialisation wraps all five converters in
+#     #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+# because __bfloat162float & friends are sm_80+ intrinsics. So the members only
+# exist for arch >= 80 -- and configure.log line 40 shows ggml picked the
+# default architecture list, which still contains 75-virtual:
+#
+#   Using CMAKE_CUDA_ARCHITECTURES=75-virtual;80-virtual;86-real;89-real;
+#                                 90-virtual;120a-real;121a-real
+#
+# The 75 pass compiles the whole kernel body (line 39 of marlin_template.h only
+# blanks it out below 750) with __CUDA_ARCH__ == 750, so MarlinScalarType<11>
+# is an empty class and every call into it fails. This is a fork bug: the 75
+# "-virtual" entry exists purely to JIT for old Turing cards, and nothing in the
+# build guards the bf16 path against it. Upstream removed the marlin kernels, so
+# nobody ever shook it out.
+#
+# Fix: stop guessing at architectures -- state the target outright.
+#
+#   -DCMAKE_CUDA_ARCHITECTURES=120-real
+#
+# Why this is right and not a workaround:
+#   - 120 means Blackwell; ggml/src/ggml-cuda/CMakeLists.txt:96-99 rewrites it to
+#     120a-real for us (FP4 tensor cores are not forwards-compatible, so the "a"
+#     variant is what you want on a consumer RTX 50 card).
+#   - The target machine is a single RTX 5060 Ti 16GB == sm_120. The 75/80/86/89/
+#     90/121 entries could never be used on it.
+#   - One arch pass instead of seven: the ggml-cuda target should now take
+#     single-digit minutes rather than the ~58 min v4 burned.
+#   - It removes the actual defect. Patching marlin_dtypes.cuh to unguard the
+#     bf16 converters would emit sm_80 intrinsics into an sm_75 compile, which
+#     nvcc would then reject -- strictly worse.
+#
+# If this box ever gets a second, older GPU, add "<arch>-real" here and rebuild.
 # ---------------------------------------------------------------------------
 # WHAT CHANGED FROM v3, AND WHY  (the CUDA job was the last thing standing)
 #
@@ -311,6 +357,7 @@ jobs:
             -DGGML_NATIVE=OFF ^
             -DGGML_CPU=OFF ^
             -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=120-real ^
             "-DCMAKE_CUDA_FLAGS=-Xcompiler /Zc:__cplusplus" ^
             -DLLAMA_BUILD_BORINGSSL=ON ${{ inputs.cuda_version == '12.4' && '-DGGML_CUDA_CUB_3DOT2=ON' || '' }} > configure.log 2>&1
           set RC=%ERRORLEVEL%
