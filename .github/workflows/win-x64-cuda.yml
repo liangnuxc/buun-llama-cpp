@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# buun-llama-cpp -- Windows x64 build (v5)
+# buun-llama-cpp -- Windows x64 build (v6)
 #
 #   ui-build                  -> llama-ui.zip
 #   windows-cpu (release)     -> full exe bundle   [preferred]
@@ -8,6 +8,51 @@
 #   package                   -> one ready-to-run release zip
 #
 # Derived from .github/workflows/release.yml in spiritbuun/buun-llama-cpp.
+# ---------------------------------------------------------------------------
+# WHAT CHANGED FROM v5, AND WHY
+#
+# v5 (run 35262969076) confirmed the v4 arch fix outright. configure.log now says
+#
+#   -- Replacing 120-real in CMAKE_CUDA_ARCHITECTURES with 120a-real
+#   -- Using CMAKE_CUDA_ARCHITECTURES=120a-real
+#
+# ...and the whole marlin family compiles. Build time for the same target fell
+# from ~58 min (7 arch passes) to ~10 min (1 pass). ui-build and BOTH windows-cpu
+# variants also went green, so the CPU/UI side is now reproducibly clean.
+#
+# The next failure was mmq.cu -- not a regression: v4 died at [57/412] and mmq.cu
+# is [61/412], so it had simply never been reached before.
+#
+#   mmq-nvfp4-tma.cuh(103): error C2719: 'map': formal parameter with requested
+#     alignment of 128 won't be aligned
+#   ..._mmq.cudafe1.stub.c(2845): error C2719: 'unnamed-parameter': ...
+#
+# C2719 is an MSVC-only error, and .cudafe1.stub.c is nvcc's generated host-side
+# kernel stub -- so this is the HOST pass. The parameter is
+# `const __grid_constant__ CUtensorMap map`, and CUtensorMap is a 128-byte TMA
+# descriptor; MSVC cannot pass a >16-byte-aligned value parameter.
+#
+# The file's own guard had the condition inverted:
+#
+#   #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#           const __grid_constant__ CUtensorMap map,
+#   #else
+#           const CUtensorMap map,
+#   #endif
+#
+# `!defined(__CUDA_ARCH__)` IS the host pass, so the attribute landed exactly
+# where it breaks MSVC. CUTLASS draws the opposite line -- see
+# cutlass/device_kernel.h:47 (both vendored copies agree):
+#
+#   #if defined(CUTLASS_GRID_CONSTANT_SUPPORTED) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+#   #  define CUTLASS_GRID_CONSTANT_ENABLED
+#
+# i.e. the macro is empty on the host by design. Fix: match CUTLASS -- attribute
+# in the device passes only. Same condition, no host-pass attribute.
+#
+# Also in v6: the Build step now runs ninja with `-k 0` (keep going, no limit).
+# v4 and v5 each burned a ~15 min CI round to reveal exactly ONE broken file. With
+# -k 0 a single run reports every remaining compile error at once.
 # ---------------------------------------------------------------------------
 # WHAT CHANGED FROM v4, AND WHY  (v4's two fixes worked; hit the next wall)
 #
@@ -370,10 +415,13 @@ jobs:
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda > cuda-build.log 2>&1
+          rem -- -k 0: keep going after a failure so ONE run surfaces every remaining
+          rem compile error instead of one error per run (vvv4/v5 each cost a full round
+          rem to reveal a single file).
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda -- -k 0 > cuda-build.log 2>&1
           set RC=%ERRORLEVEL%
-          powershell -NoProfile -Command "Get-Content cuda-build.log -Tail 250"
-          if not %RC%==0 powershell -NoProfile -Command "Select-String -Path cuda-build.log -Pattern 'error|FAILED' | Select-Object -First 40 | ForEach-Object { $_.Line }"
+          powershell -NoProfile -Command "Get-Content cuda-build.log -Tail 200"
+          if not %RC%==0 powershell -NoProfile -Command "Select-String -Path cuda-build.log -Pattern 'FAILED:|error C[0-9]|error:' | Select-Object -ExpandProperty Line -Unique | Select-Object -First 200"
           exit /b %RC%
 
       - name: Upload build log (always)

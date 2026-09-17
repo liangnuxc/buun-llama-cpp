@@ -97,9 +97,15 @@ static __device__ __forceinline__ void nvfp4_tma_dot(const int * x, const int * 
 #endif
 
 static __global__ __launch_bounds__(256, 1) void mul_mat_nvfp4_tma(
-// Keep the aligned descriptor grid-constant in the host pass too (MSVC C2719).
-// Pascal device compilation cannot use __grid_constant__; this kernel never runs there.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+// __grid_constant__ must NOT leak into the host pass. nvcc's host stub declares
+// this parameter by value, and MSVC refuses a by-value parameter whose type
+// needs more than 16 bytes of alignment -- error C2719, "requested alignment of
+// 128 won't be aligned". CUtensorMap is a 128-byte TMA descriptor.
+// CUTLASS draws exactly the same line: CUTLASS_GRID_CONSTANT_ENABLED (see
+// cutlass/device_kernel.h:47) requires `defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700`,
+// so the macro expands to nothing on the host. Match that: attribute only in the
+// device passes, where the descriptor can live in grid-constant memory.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
         const __grid_constant__ CUtensorMap map,
 #else
         const CUtensorMap map,
