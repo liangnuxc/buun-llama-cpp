@@ -71,7 +71,7 @@ env:
   GH_TOKEN: ${{ github.token }}
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   # exactly as in the upstream release workflow -- drops examples/tests, keeps tools+server
-  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=OFF"
 
 jobs:
   # -------------------------------------------------------------------------
