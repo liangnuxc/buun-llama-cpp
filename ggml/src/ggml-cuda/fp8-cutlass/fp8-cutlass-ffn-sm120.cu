@@ -9,6 +9,14 @@ struct PairedEpilogue {
     using Base               = Retained::Epi;
     using ElementC           = float;
     using ElementD           = float;
+    // CUTLASS 4.3.4's GemmUniversalAdapter derives kAlignmentC/kAlignmentD from these
+    // two aliases (gemm/device/gemm_universal_adapter.h:202-205). This epilogue is
+    // hand-rolled and moves its operands with plain pointer loads, so there is no gmem
+    // tiled copy to name -- `void` is the documented "none" value
+    // (see cutlass/epilogue/collective/default_epilogue.hpp), and
+    // get_alignment_count_from_gmem_tiled_copy() maps it to 1.
+    using GmemTiledCopyC     = void;
+    using GmemTiledCopyD     = void;
     using ThreadEpilogueOp   = typename Base::ThreadEpilogueOp;
     using StrideC            = typename Base::StrideC;
     using StrideD            = typename Base::StrideD;
