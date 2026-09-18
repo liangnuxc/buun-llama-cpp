@@ -159,7 +159,27 @@ if (CUDAToolkit_FOUND)
     # The native F32-channel FP8 provider is compiled into the backend, not
     # loaded from a benchmark directory. Its CUTLASS headers are isolated from
     # the backend's other vendored versions and its device code is SM120-only.
+    #
+    # MSVC is excluded on purpose. These kernels are TMA kernels: CUTLASS passes
+    # Operator::Params to cutlass::device_kernel by value, and CUDA 13.x declares
+    # CUtensorMap with 128-byte alignment. cl.exe rejects any by-value parameter
+    # whose alignment exceeds 16 bytes, and the error surfaces on the nvcc
+    # generated host stub:
+    #   ...cudafe1.stub.c(NN): error C2719: 'unnamed-parameter': formal parameter
+    #   with requested alignment of 128 won't be aligned
+    # No attribute placement fixes this -- __grid_constant__ is irrelevant here
+    # (see cutlass/device_kernel.h:47, which already keeps it out of the host
+    # pass), the alignment belongs to the type itself. microsoft/onnxruntime#29776
+    # hits the identical error and resolves it the same way, by excluding TMA
+    # from the Windows build.
+    #
+    # Dropping this target is safe: fp8-channel.cu has a complete generic
+    # fallback behind the GGML_CUDA_FP8_CUTLASS define (fp8_cutlass_provider()
+    # returns nullptr and ggml_cuda_fp8_channel_pair() returns false, so the
+    # caller in ggml-cuda.cu falls through to the normal path). FP8 still works,
+    # only the paired dual-GEMM FFN fast path is absent on MSVC.
     if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+            NOT MSVC AND
             CMAKE_CUDA_ARCHITECTURES MATCHES "(^|;)120(a|f)?(-real|-virtual)?(;|$)")
         add_library(ggml-cuda-fp8-cutlass OBJECT fp8-cutlass/fp8-cutlass-ffn-sm120.cu)
         set_target_properties(ggml-cuda-fp8-cutlass PROPERTIES
