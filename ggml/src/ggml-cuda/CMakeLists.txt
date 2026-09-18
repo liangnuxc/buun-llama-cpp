@@ -168,6 +168,13 @@ if (CUDAToolkit_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/fp8-cutlass/vendor/include")
         target_compile_options(ggml-cuda-fp8-cutlass PRIVATE
             -O3 -use_fast_math --expt-relaxed-constexpr -extended-lambda)
+        if (MSVC)
+            # This OBJECT library is not ggml-cuda, so it does not inherit the
+            # /Zc:preprocessor that CUDA_CXX_FLAGS adds near the bottom of this file.
+            # CCCL 3.2+ hard-errors from cuda/std/__cccl/preprocessor.h without it,
+            # and the CUTLASS headers below pull CCCL in.
+            target_compile_options(ggml-cuda-fp8-cutlass PRIVATE -Xcompiler=/Zc:preprocessor)
+        endif()
         target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-fp8-cutlass>)
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_FP8_CUTLASS)
     endif()

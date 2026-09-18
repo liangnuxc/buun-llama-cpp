@@ -3,7 +3,15 @@
 // The packed NVFP4 and MMQ activation layouts are unchanged. TMA brings two
 // K256 stages into shared memory while the current stage feeds the same K64
 // MMA/reduction sequence as the generic whole-K kernel.
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+//
+// MSVC cannot pass a by-value parameter whose type requests more than 16 bytes of
+// alignment -- error C2719, "requested alignment of 128 won't be aligned" -- and
+// CUtensorMap is alignas(128). This kernel has to take the descriptor by value so
+// the TMA unit can read it straight out of the param buffer, and that calling
+// convention has no MSVC equivalent. The fast path is therefore compiled out when
+// the host compiler is MSVC: ggml_cuda_mmq_nvfp4_tma() returns false and MMQ falls
+// back to the generic whole-K kernel, which computes the same result.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080 && !defined(_MSC_VER)
 
 namespace {
 
@@ -97,15 +105,9 @@ static __device__ __forceinline__ void nvfp4_tma_dot(const int * x, const int * 
 #endif
 
 static __global__ __launch_bounds__(256, 1) void mul_mat_nvfp4_tma(
-// __grid_constant__ must NOT leak into the host pass. nvcc's host stub declares
-// this parameter by value, and MSVC refuses a by-value parameter whose type
-// needs more than 16 bytes of alignment -- error C2719, "requested alignment of
-// 128 won't be aligned". CUtensorMap is a 128-byte TMA descriptor.
-// CUTLASS draws exactly the same line: CUTLASS_GRID_CONSTANT_ENABLED (see
-// cutlass/device_kernel.h:47) requires `defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700`,
-// so the macro expands to nothing on the host. Match that: attribute only in the
-// device passes, where the descriptor can live in grid-constant memory.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+// Keep the aligned descriptor grid-constant in the host pass too (MSVC C2719).
+// Pascal device compilation cannot use __grid_constant__; this kernel never runs there.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
         const __grid_constant__ CUtensorMap map,
 #else
         const CUtensorMap map,
@@ -166,7 +168,10 @@ static __global__ __launch_bounds__(256, 1) void mul_mat_nvfp4_tma(
 #endif
 
 bool ggml_cuda_mmq_nvfp4_tma(const mmq_args & a, cudaStream_t stream) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+// Same reasoning as the kernel guard above: the body needs the MSVC-incompatible
+// by-value CUtensorMap, so on MSVC this always reports "not applicable" and MMQ
+// stays on the generic kernel.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080 && !defined(_MSC_VER)
     const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
     if (device.cc != GGML_CUDA_CC_BLACKWELL || !blackwell_mma_available(device.cc) ||
         device.smpbo < sizeof(nvfp4_tma_storage) ||
